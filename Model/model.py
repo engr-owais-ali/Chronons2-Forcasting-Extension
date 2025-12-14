@@ -152,7 +152,8 @@ class Chronos2Encoder(nn.Module):
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 e
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, seq_length, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+             attention_mask = torch.ones(batch_size, seq_length, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
 
         # make the time attention mask broadcastable to attention scores (batch, n_heads, q_len, kv_len) and invert
         # Time attention mask:
@@ -175,7 +176,7 @@ e
             layer_outputs: Chronos2EncoderBlockOutput = layer_module(
                 hidden_states,
                 position_ids=position_ids,
-                attention_mask=extended_attention_mask,
+                attention_mask=time_attention_mast,
                 group_time_mask=group_time_mask,
                 num_output_patches=num_output_patches,
                 reg_token_index=reg_token_index,

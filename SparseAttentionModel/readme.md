@@ -1,367 +1,154 @@
+# Summary of model-side changes for the Sparse Time Attention extension (Chronos-2)
+
+Here, we summarizes **what was changed inside the Chronos-2 model implementation** (relative to the original “full” temporal attention path), specifically to support the **sparse time-attention** variant used in our experiments.
+
+> Scope: This is about **model/config + attention implementation**.  
+> It does **not** cover the external evaluation scripts except where they interact with model flags (e.g., forcing `time_attention_type="full"` to extract attentions).
 
 ---
 
-# Chronos-2 Long-Context Throughput Upgrade (Flash + Landmarks) — Reference Summary
+## 1) New / exposed configuration knobs (model + pipeline)
 
-## Goal
+We rely on Chronos-2’s configurable time-attention mechanism and expose/override the following fields through the pipeline constructor / model config:
 
-Scale Chronos-2 time attention from ~512 patch tokens to ~2000+ patch tokens (e.g., 32k steps / 16 patch) with:
+- `time_attention_type`
+  - `"full"`: standard dense temporal self-attention over all time tokens
+  - `"windowed_future_global"`: sparse variant (local past + global future)
+- `time_local_radius`
+  - integer radius `r` used for **local past attention**
+- `time_attention_chunk_size`
+  - chunk size for computing attention in pieces (reduces peak memory pressure and can enable kernels)
+- `time_attention_backend`
+  - `"torch"` (eager/standard) or `"flash"` (if supported)
+- `time_use_landmarks`
+  - forced **False** in our experiments for apples-to-apples comparisons and to simplify attention semantics
+- `time_reg_is_global` (optional)
+  - affects the “REG token” row semantics (if the model uses a REG token):
+    - if enabled, the REG query can attend globally to context keys (but still not to future keys)
 
-* **best throughput** via **FlashAttention sliding-window** on context
-* **long-range usefulness** via **landmark summary tokens**
-* consistent Chronos-2 semantics: **REG between context and future**, **no context→future leakage**, and **time index scaling** aligned with context length.
-
----
-
-# What was modified, by file
-
-## 1) `config.py`
-
-### Intended feature additions
-
-Add config fields:
-
-* `time_attention_backend: Literal["torch","flash"] = "torch"`
-* `time_use_landmarks: bool = False`
-* `time_landmark_stride: int = 64`
-* `time_landmark_project: bool = False`
-
-Plus validations:
-
-* `time_attention_backend in {"torch","flash"}`
-* `time_landmark_stride > 0`
-
-### Critical fix discovered in your uploaded version
-
-Your current `config.py` has **duplicate `__init__` arguments** (e.g., `time_landmark_stride` appears twice), which is a **hard syntax/import error**.
-**Action:** remove duplicates; keep one copy of each param and store them once.
+**Important:** In our “attention mass” probes we explicitly set:
+- `time_attention_type="full"`
+- `time_use_landmarks=False`
+so that the model returns full attention weights (`output_attentions=True`) without additional sparsification.
 
 ---
 
-## 2) `model.py` (Landmarks + “don’t shift future positions”)
+## 2) Temporal attention behavior change: from dense to structured sparsity
 
-### Changes made
+### Original (Full)
+For each encoder layer, temporal self-attention computes attention for all query positions `q` over all key positions `k` in the time-token sequence:
 
-1. **Import**
+- attention matrix shape: `[B, H, S, S]`
+- all `S×S` query-key edges are allowed (subject to the usual masking)
 
-* Add `import torch.nn.functional as F`
+### Modified (Sparse / `windowed_future_global`)
+We change the **allowed attention pattern** along the time axis:
 
-2. **Landmark modules in `__init__`**
+Let:
+- `S` = number of time tokens after patching
+- `num_output_patches` = number of future output patches for the prediction horizon
+- `future_start = S - num_output_patches`
+- `ctx_end = future_start`
 
-* Read config safely with `getattr`:
+Then the sparse pattern is:
 
-  * `self.time_use_landmarks`
-  * `self.time_landmark_stride`
-  * `self.time_landmark_project`
-* Optional `nn.Linear` projection for landmarks
-* Add a learned `time_landmark_type_embed` parameter to distinguish landmarks from patch tokens
+#### A) Context (past) queries: **local window**
+For query positions `q < ctx_end` (i.e., in the context portion):
+- allowed keys `k` are restricted to a local window:
+  - `k ∈ [max(0, q-r), min(ctx_end-1, q+r)]`
 
-3. **Add helper method**
+This reduces context attention complexity from `O(ctx_end²)` toward `O(ctx_end · r)`.
 
-* `_interleave_time_landmarks(ctx_embeds, ctx_pad_mask, ctx_position_ids, stride)`
+#### B) Future queries: **global**
+For query positions `q ≥ future_start` (future/output patches):
+- allowed keys are **global over all tokens**:
+  - `k ∈ [0, S-1]`
 
-  * Inserts one pooled landmark token per `stride` context tokens
-  * Landmark position id uses **chunk midpoint** in original context timeline
-  * Mask-aware mean pooling so padding doesn’t contaminate pooling (though later we aim for no padding in context)
+This preserves the model’s ability to condition future decoding on the entire context.
 
-4. **In `encode()`**
-
-* Convert attention masks to 0/1 float mask
-* Build `ctx_position_ids = [0..num_context_patches-1]`
-* If landmarks enabled: interleave landmarks into the context **without shifting future timeline**
-* Append REG after (context + landmarks)
-* Concatenate future tokens
-
-5. **Completed `position_ids` logic (the previously incomplete part)**
-   Build `position_ids` such that:
-
-* Context patch positions: `0..num_context_patches-1`
-* Landmark positions: inside that same `0..num_context_patches-1` timeline (midpoints)
-* REG position: `num_context_patches`
-* Future positions:
-
-  * start at `num_context_patches+1` if REG exists,
-  * else start at `num_context_patches`
-    This ensures landmark insertion does **not** change future RoPE phases.
-
-6. **Pass `position_ids` into encoder**
-
-* Add `position_ids=position_ids` in `self.encoder(...)`
-
-### Critical fix discovered in your uploaded version
-
-`forward()` still contains an assert assuming no landmarks:
-
-```python
-assert hidden_states.shape == (B, num_context_patches + 1 + num_output_patches, D)
-```
-
-This **must be updated** to include:
-
-* `num_landmarks = ceil(num_context_patches / stride)` if landmarks enabled
-* `num_reg = 1 if use_reg_token else 0`
-* expected seq = `num_context_patches + num_landmarks + num_reg + num_output_patches`
+#### C) REG token (optional policy)
+If the model has a REG token and `time_reg_is_global=True`:
+- the REG query row is allowed to attend **globally over context keys only**
+- REG does **not** attend to future keys
 
 ---
 
-## 3) `layers.py` (Flash sliding-window for context)
+## 3) Chunked attention computation (implementation detail)
 
-### Purpose
+To avoid allocating / materializing large attention matrices at once, the sparse attention path supports **chunked** computation, controlled by:
 
-Implement `"windowed_future_global"` time attention with:
+- `time_attention_chunk_size`
 
-* **context queries:** sliding-window **local** attention
-
-  * fast path: **FlashAttention** if enabled and context has no padding
-  * fallback: existing torch gather/chunk implementation
-* **future queries:** global attention (as before), while preserving “no context→future leakage” rules.
-
-### Changes made
-
-1. **Optional FlashAttention import**
-
-* try-import `flash_attn_func` safely; if not available, set to `None`
-
-2. **Added helper**
-   `_flash_sliding_window_local_attn_no_scale(q,k,v,radius,dropout_p,training)`
-
-* Converts [B,H,S,Hd] to Flash expected layout
-* Calls FlashAttention with window `(radius,radius)`
-* Uses `softmax_scale=1.0` to match Chronos-2 “no scaling”
-* Returns [B,H,S,Hd]
-
-3. **Modified `_windowed_future_global_attention`**
-
-* Determine `backend = config.time_attention_backend` (`"torch"` or `"flash"`)
-* Flash path requirements:
-
-  * CUDA tensor
-  * dtype fp16/bf16
-  * **context has no padding** (`key_pad_ctx.all() == True`)
-* If `can_use_flash`:
-
-  * compute context output via flash local attention
-* Else:
-
-  * run existing torch windowed attention using gather + chunking (checkpointed)
-
-### Critical fix discovered in your uploaded version
-
-Even when flash path runs, the code **still enters the torch chunk loop** afterward, but variables like `offsets` are only defined in the fallback branch.
-**Action:** ensure the context chunk loop runs **only if not `can_use_flash`** (guard loop or move it inside `else:`).
+Behavior:
+- attention is computed in blocks/chunks along the time dimension
+- this reduces peak memory and sometimes improves runtime
+- however, for Chronos-2’s effective token lengths after patching, the overhead may dominate (we observed speedups around ~1 or slightly <1 in many cases)
 
 ---
 
-## 4) `dataset.py` (Full context windows to unlock Flash fast path)
+## 4) Backend support (torch vs flash)
 
-### Purpose
+The model attention layer supports different backends:
 
-Flash path requires **no padding** inside context, so the dataset must provide full windows.
+- `time_attention_backend="torch"`
+  - standard PyTorch attention computation
+  - easiest path for extracting attention weights
+- `time_attention_backend="flash"`
+  - uses a flash-attention style kernel if available
+  - faster in some regimes but can be more sensitive to dtype/masking semantics
 
-### Changes made
-
-Add `require_full_context` mode:
-
-* In `Chronos2Dataset.__init__` add `require_full_context: bool = False`
-* Store `self.require_full_context`
-* Thread it through `_prepare_tasks(...)` and `convert_inputs(...)`
-
-Behavior when `require_full_context=True`:
-
-* Filter out series too short to provide **full context + prediction**
-* Sampling (`TRAIN`): choose `slice_idx >= context_length`
-* `VALIDATION`: enforce last slice has full context
-* `TEST`: enforce full series length >= context_length
-* In `_construct_slice`: raise if context would be shorter than context_length
-* In `_build_batch`: if `require_full_context` then use `torch.cat(...)` instead of left padding
+**Important note:** Some configurations can produce **NaNs** (especially under `flash` + bf16 in certain tasks/settings). In those cases:
+- switch backend to `"torch"`, or
+- try fp16/fp32, or
+- adjust chunk size / radius
 
 ---
 
-## 5) `pipeline.py` (Expose knobs + autocast for Flash)
+## 5) Attention weights extraction (for analysis)
 
-### Changes made
+Chronos-2 exposes temporal attention weights when called with:
+- `output_attentions=True`
 
-1. Extend `fit()` signature with optional overrides:
+Output field used:
+- `enc_time_self_attn_weights`: list of tensors per layer, each shaped `[B, H, S, S]`
 
-* `time_attention_backend`
-* `time_use_landmarks`
-* `time_landmark_stride`
-* `time_landmark_project`
-* `time_local_radius`
-* `time_attention_chunk_size`
+For our “mass retained” measurement we ensured:
+- the model is in `time_attention_type="full"` mode (so weights correspond to dense learned attention)
+- we apply our *analysis-time mask* to those weights to estimate how much mass would be kept/dropped under sparse patterns
 
-2. Apply overrides to the copied config in `fit()`
-
-* set corresponding `setattr(config, ...)`
-
-3. Ensure trainer uses mixed precision when flash backend:
-
-* if backend `"flash"` and GPU is pre-SM80: set `training_kwargs["fp16"]=True`
-* if SM80+: `bf16=True` already exists
-
-4. Add inference-time autocast (to avoid flash failing in fp32)
-
-* Add helper `_flash_autocast_dtype()` returning bf16 on SM80+ else fp16
-* Wrap model calls in `_predict_step()` inside `torch.autocast(...)` when backend is flash
-* Wrap `embed()` calls similarly
-
-### Critical fix discovered in your uploaded version
-
-Time encoding scale must update when context is extended:
-
-* Your current code uses `.get("time_encoding_scale", context_length)`, which **won’t override** an existing value.
-  **Action:** set it unconditionally:
-
-```python
-config.chronos_config["time_encoding_scale"] = context_length
-```
-
-### Required wiring (done or to verify)
-
-When building datasets (train/val), pass:
-
-```python
-require_full_context = (config.time_attention_backend == "flash")
-```
+This is analysis-only; the actual sparse model uses the sparse pattern during forward passes and does **not** necessarily return a full `[S,S]` matrix in all backends.
 
 ---
 
-## 6) `trainer.py` (Warning only; dataset not built here)
+## 6) What was not changed in the model
 
-### Intended change
+- No changes to:
+  - tokenization / patching logic
+  - group attention logic
+  - quantile heads / probabilistic forecasting
+  - model weights (no fine-tuning)
+  - dataset processing rules
 
-Add a warning if:
-
-* backend is `"flash"` but dataset wasn’t created with `require_full_context=True`
-
-### Critical fix discovered in your uploaded version
-
-You added a free function `_warn_flash_backend_dataset_mismatch(...)` but trainer calls:
-
-```python
-self._warn_if_flash_without_full_context(...)
-```
-
-which does not exist.
-**Action:** either:
-
-* change calls to `_warn_flash_backend_dataset_mismatch(self.model, dataset, split=...)`, or
-* add a method wrapper `_warn_if_flash_without_full_context(...)` inside the class.
+All changes are isolated to:
+- temporal attention configuration
+- temporal attention masking policy
+- chunked computation / backend selection
 
 ---
 
-## 7) `__init__.py`
-
-Optional enhancement:
-
-* export `DatasetMode` from package root:
-
-```python
-from .dataset import Chronos2Dataset, DatasetMode
-```
-
-and include in `__all__`.
-
 ---
 
-# Current known blockers / must-fix checklist before evaluation
+## Checklist of model-side knobs used in this project
 
-**These must be fixed before running benchmarks:**
+Typical sparse run:
+- `time_attention_type="windowed_future_global"`
+- `time_local_radius=r`
+- `time_attention_chunk_size=256` (example)
+- `time_attention_backend={"torch"|"flash"}`
+- `time_use_landmarks=False`
 
-1. `config.py` — remove duplicate `__init__` args (hard import error)
-2. `layers.py` — ensure torch chunk loop doesn’t run after flash path
-3. `trainer.py` — fix missing method call vs free function mismatch
-4. `model.py` — update hidden_states shape assert to include landmarks and reg token
-5. `pipeline.py` — set `time_encoding_scale = context_length` unconditionally
-
----
-
-# How the final system is supposed to work (reference behavior)
-
-## Attention pattern
-
-* Context queries:
-
-  * local sliding window over context keys
-  * plus REG global query if `time_reg_is_global=True` (optional)
-* Future queries:
-
-  * global attention over all keys (context + landmarks + REG + future per design)
-* No leakage rules preserved by existing masks/layout.
-
-## Landmarks
-
-* Inserted **inside context** (before REG)
-* One per `stride` context patches
-* Pooling = mask-aware mean
-* Landmark position ids = chunk midpoints in original timeline
-* Future positions not shifted by landmark insertion
-
-## Flash usage conditions
-
-Flash local sliding-window triggers when:
-
-* `config.time_attention_backend == "flash"`
-* CUDA
-* dtype bf16/fp16 (pipeline autocast ensures this for inference)
-* **context key padding mask is all valid** (dataset full-context ensures this)
-
----
-
-# Instructions for “future me” to continue with evaluation
-
-When the user shares their latest files again:
-
-## Step A — verify correctness quickly
-
-1. **Import test**: `import chronos2` (or your package name)
-2. Instantiate config + model with:
-
-   * `time_attention_type="windowed_future_global"`
-   * `time_attention_backend="flash"`
-   * `time_use_landmarks=True`
-   * `time_landmark_stride=64`
-   * `context_length` large (e.g., 32768 steps → 2048 patches)
-3. Run one forward pass and one backward pass with synthetic data
-4. Confirm flash fast path is actually used:
-
-   * easiest: add a temporary print/log in layers when `can_use_flash=True` (remove afterward)
-   * or measure speed difference (flash vs torch) under the same setting.
-
-## Step B — evaluation code to generate
-
-Provide a **single evaluation script** that:
-
-1. Runs **resource-only benchmark** (synthetic):
-
-   * token lengths: 512, 1024, 2048 patches (context steps = tokens * patch_size)
-   * modes:
-
-     * torch backend, no landmarks
-     * torch backend, landmarks
-     * flash backend, no landmarks
-     * flash backend, landmarks
-   * measures:
-
-     * forward time
-     * backward time
-     * step time (fwd+bwd+opt)
-     * peak VRAM (`torch.cuda.max_memory_allocated`)
-2. Runs **inference sanity check** (optional):
-
-   * fixed seed
-   * 1–2 batches from a real dataset subset
-   * compare metrics (MAE/MSE) and ensure outputs are finite
-3. Saves results to:
-
-   * printed table
-   * CSV/JSON file for plotting
-
-## Step C — evaluation must respect these constraints
-
-* Always run on GPU when flash backend enabled
-* Ensure autocast dtype is used for flash inference
-* Ensure dataset uses `require_full_context=True` when backend is flash
-* Use consistent batch sizes across comparisons or scale down as needed to fit VRAM.
-
----
+Typical attention-mass probe:
+- `time_attention_type="full"`
+- `time_use_landmarks=False`
+- `output_attentions=True`
+- (optional) `time_reg_is_global=True/False`
